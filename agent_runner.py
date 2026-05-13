@@ -415,7 +415,7 @@ def main():
 
     # Usage 采集：Claude 走 UsageTracker（Anthropic SDK hook），其余从 LangChain response metadata 采集
     if RCA_MODEL.startswith("claude"):
-        usage = _tracker.get_usage()
+        usage = (_tracker.get_usage() if _tracker else {})
     else:
         # 非 Claude 模型：从 AIMessage.usage_metadata 累加（LangChain 自动解析 OpenAI SDK response）
         _total_in, _total_out, _llm_calls = 0, 0, 0

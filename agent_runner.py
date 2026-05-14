@@ -359,8 +359,10 @@ def main():
     if data_dir:
         user_prompt = f"{user_prompt}\n\n## Data Location\n\nThe telemetry data for this incident is located at: `{data_dir}`\n\nStart by calling `list_tables_in_directory(directory=\"{data_dir}\")` to discover available parquet files."
 
-    # RCA 领域指令在前（主体），反思方法论在后（补充）
-    combined_sp = system_prompt + "\n\n---\n\n" + rca_think_prompt
+    # Use system_prompt as-is (matches ThinkDepthAI upstream graph.py L94).
+    # Legacy `+ rca_think_prompt` was a SOTA-agents historical patch not in
+    # upstream; RCA_ANALYSIS_SP already states "think_tool REQUIRED after each query".
+    combined_sp = system_prompt
 
     mw_version = os.environ.get("MIDDLEWARE_VERSION", "v3").lower()
     v4_config = V4Config()

@@ -1,10 +1,33 @@
-.venv/
-__pycache__/
-*.pyc
-.pytest_cache/
-.mypy_cache/
-*.egg-info/
-.env
-.env.local
+# Credentials: only the examples are tracked
+.env*
+!.env*.example
+
+# Run outputs and data
+data/
+experiments/
+outputs/
 results/
-output/
+runs/
+events.jsonl
+*.jsonl
+*.parquet
+*.log
+*.db
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.ipynb_checkpoints/
+.venv/
+env/
+venv/
+*.egg-info/
+build/
+dist/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# OS
+.DS_Store

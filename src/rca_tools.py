@@ -1,7 +1,8 @@
 import json
+import os
 from datetime import datetime
 from pathlib import Path
-from typing import Union, List, Optional
+from typing import Union, List
 from langchain_core.tools import tool
 
 TOKEN_LIMIT = 5000
@@ -67,171 +68,128 @@ def _enforce_token_limit(payload: str, context: str) -> str:
     }
     return json.dumps(warning, ensure_ascii=False, indent=2)
 
-ALLOWED_STEMS = {
-    "normal_logs", "abnormal_logs",
-    "normal_traces", "abnormal_traces",
-    "normal_metrics", "abnormal_metrics",
-    "normal_metrics_histogram", "abnormal_metrics_histogram",
-    "normal_metrics_sum", "abnormal_metrics_sum",
-}
+
+def _sandbox_root() -> Path:
+    """The case's telemetry directory; the runner sets it from the payload's data_dir."""
+    value = os.environ.get("RCA_CASE_DATA_DIR")
+    if not value:
+        raise RuntimeError("RCA_CASE_DATA_DIR is not set")
+    return Path(value)
+
+
+def sandbox_tables() -> dict[str, list[str]]:
+    """Table name -> parquet files of this case: <name>.parquet, or <name>/*.parquet when split into parts."""
+    tables: dict[str, list[str]] = {}
+    for entry in sorted(_sandbox_root().iterdir()):
+        name = entry.name if entry.is_dir() else entry.stem
+        if entry.is_dir():
+            parts = sorted(str(p) for p in entry.glob("*.parquet"))
+            if parts:
+                tables[name] = parts
+        elif entry.suffix == ".parquet":
+            tables[name] = [str(entry)]
+    return tables
+
+
+def _read_source(files: list[str]) -> str:
+    """SQL source of one table; parts are merged by column name."""
+    quoted = ", ".join("'" + f.replace("'", "''") + "'" for f in files)
+    return f"read_parquet([{quoted}], union_by_name=true)"
+
+
+def _resolve_table(table: str) -> list[str]:
+    """Resolve a model-visible table name inside the case directory."""
+    tables = sandbox_tables()
+    if str(table) not in tables:
+        raise ValueError("Use a table name returned by list_tables_in_directory")
+    return tables[str(table)]
+
+
+def _safe_tool_error(exc: Exception) -> str:
+    return str(exc).replace(str(_sandbox_root()) + os.sep, "").replace(".parquet", "")
+
 
 def _sanitize_column_name(name: str) -> str:
     """Replace dots in column names with underscores to avoid DuckDB dot-notation ambiguity."""
     return name.replace(".", "_")
 
 
-def _build_rename_select(parquet_path: str) -> str:
-    """Build a SELECT clause that renames dot-containing columns for a parquet file.
+def _quote_identifier(name: str) -> str:
+    return '"' + name.replace('"', '""') + '"'
 
-    Returns 'SELECT col1, "attr.x" AS attr_x, ...' or 'SELECT *' if no renames needed.
-    """
+
+def _build_rename_select(source: str) -> str:
+    """SELECT clause that renames dot-containing columns, or '*' if none needs it."""
     duckdb = _import_duckdb()
     conn = duckdb.connect(":memory:")
     try:
-        result = conn.execute(f"SELECT * FROM read_parquet('{parquet_path}') LIMIT 0")
-        columns = [desc[0] for desc in result.description]
+        columns = [desc[0] for desc in conn.execute(f"SELECT * FROM {source} LIMIT 0").description]
     finally:
         conn.close()
-
-    needs_rename = any("." in col for col in columns)
-    if not needs_rename:
+    if not any("." in col for col in columns):
         return "*"
-
-    parts = []
-    for col in columns:
-        if "." in col:
-            parts.append(f'"{col}" AS {_sanitize_column_name(col)}')
-        else:
-            parts.append(col)
-    return ", ".join(parts)
+    return ", ".join(f"{_quote_identifier(col)} AS {_quote_identifier(_sanitize_column_name(col))}" for col in columns)
 
 
-def _validate_parquet_files(parquet_files: Union[str, List[str]]) -> List[str]:
-    """Validate parquet files exist and return as list."""
-    if isinstance(parquet_files, str):
-        # Some models (e.g. Qwen) serialize list args as JSON strings:
-        #   '["file1.parquet", "file2.parquet"]' or '"file.parquet"'
-        stripped = parquet_files.strip()
+def _table_names(tables: Union[str, List[str]]) -> List[str]:
+    """Some models (e.g. Qwen) serialize list arguments as JSON strings."""
+    if isinstance(tables, str):
+        stripped = tables.strip()
         if stripped.startswith("["):
             try:
-                parquet_files = json.loads(stripped)
+                parsed = json.loads(stripped)
+                return parsed if isinstance(parsed, list) else [stripped]
             except (json.JSONDecodeError, ValueError):
-                parquet_files = [parquet_files]
-        elif stripped.startswith('"') and stripped.endswith('"'):
-            parquet_files = [stripped.strip('"')]
-        else:
-            parquet_files = [parquet_files]
+                return [stripped]
+        return [stripped.strip('"')]
+    return list(tables)
 
-    for file_path in parquet_files:
-        if not Path(file_path).exists():
-            raise FileNotFoundError(
-                f"Parquet file not found: {file_path}\n"
-                f"Please check the file path and ensure the file exists. "
-                f"You may use 'list_tables_in_directory' to discover available parquet files."
-            )
-    return parquet_files
 
 @tool
-def list_tables_in_directory(directory: str) -> str:
+def list_tables_in_directory(directory: str = ".") -> str:
     """
-    List all parquet files in a directory with metadata.
+    List telemetry tables in the current incident with metadata.
 
     Args:
-        directory: Directory path to search for parquet files
+        directory: Use "." to list the current incident's telemetry tables
 
     Returns:
-        JSON string containing list of files with metadata
+        JSON string containing table names and metadata
     """
     duckdb = _import_duckdb()
-
-    dir_path = Path(directory)
-    if not dir_path.exists():
-        return json.dumps({"error": f"Directory not found: {directory}"})
-
-    if not dir_path.is_dir():
-        return json.dumps({"error": f"Path is not a directory: {directory}"})
-
+    if directory not in (".", "", "tables"):
+        return json.dumps({"error": "Use directory='.' for the current case"})
     files_info = []
-    cwd = Path.cwd()
-
-    # Use rglob to find parquet files recursively (only allowed stems)
-    for file_path in sorted(dir_path.rglob("*.parquet")):
-        if Path(file_path).stem not in ALLOWED_STEMS:
-            continue
-        file_path_str = str(file_path)
-        file_path_obj = Path(file_path_str)
-        if file_path_obj.is_absolute():
-            try:
-                file_path_str = str(file_path_obj.relative_to(cwd))
-            except ValueError:
-                file_path_str = str(file_path_obj)
-        
+    for name, files in sandbox_tables().items():
+        conn = duckdb.connect(":memory:")
         try:
-            conn = duckdb.connect(":memory:")
-            row_count_result = conn.execute(f"SELECT COUNT(*) FROM read_parquet('{file_path}')").fetchone()
-            if row_count_result is None:
-                row_count = 0
-            else:
-                row_count = row_count_result[0]
-            
-            result = conn.execute(f"SELECT * FROM read_parquet('{file_path}') LIMIT 0")
-            column_count = len(result.description)
-            conn.close()
-
-            files_info.append(
-                {
-                    "filename": file_path.name,
-                    "path": str(file_path),
-                    "row_count": row_count,
-                    "column_count": column_count,
-                }
-            )
+            source = _read_source(files)
+            row_count = conn.execute(f"SELECT COUNT(*) FROM {source}").fetchone()[0]
+            column_count = len(conn.execute(f"SELECT * FROM {source} LIMIT 0").description)
+            files_info.append({"table": name, "row_count": row_count, "column_count": column_count})
         except Exception as e:
-            files_info.append({
-                "filename": file_path.name, 
-                "path": str(file_path), 
-                "error": str(e)
-            })
+            files_info.append({"table": name, "error": _safe_tool_error(e)})
+        finally:
+            conn.close()
+    return _enforce_token_limit(json.dumps(files_info, ensure_ascii=False, indent=2), "list_tables_in_directory")
 
-    result_json = json.dumps(files_info, ensure_ascii=False, indent=2)
-    return _enforce_token_limit(result_json, "list_tables_in_directory")
 
-def _get_schema_one(parquet_file: str) -> dict:
-    """Get schema for a single parquet file, returning a dict."""
+def _get_schema_one(table: str) -> dict:
+    """Schema of one table."""
     duckdb = _import_duckdb()
-
-    if not Path(parquet_file).exists():
-        return {"error": f"Parquet file not found: {parquet_file}"}
-
+    try:
+        files = _resolve_table(table)
+    except ValueError as exc:
+        return {"error": str(exc)}
     conn = duckdb.connect(":memory:")
     try:
-        cwd = Path.cwd()
-        parquet_file_obj = Path(parquet_file)
-        if parquet_file_obj.is_absolute():
-            try:
-                parquet_file_rel = str(parquet_file_obj.relative_to(cwd))
-            except ValueError:
-                parquet_file_rel = str(parquet_file_obj)
-        else:
-            parquet_file_rel = parquet_file
-
-        result = conn.execute(f"SELECT * FROM read_parquet('{parquet_file}') LIMIT 0")
-        schema = [{"name": _sanitize_column_name(desc[0]), "type": str(desc[1])} for desc in result.description]
-
-        row_count_result = conn.execute(f"SELECT COUNT(*) FROM read_parquet('{parquet_file}')").fetchone()
-        if row_count_result is None:
-            row_count = 0
-        else:
-            row_count = row_count_result[0]
-
-        return {
-            "file": parquet_file,
-            "row_count": row_count,
-            "columns": schema,
-        }
-
+        source = _read_source(files)
+        schema = [{"name": _sanitize_column_name(desc[0]), "type": str(desc[1])}
+                  for desc in conn.execute(f"SELECT * FROM {source} LIMIT 0").description]
+        return {"table": table, "row_count": conn.execute(f"SELECT COUNT(*) FROM {source}").fetchone()[0],
+                "columns": schema}
     except Exception as e:
-        return {"error": f"Failed to extract schema: {str(e)}"}
+        return {"error": f"Failed to extract schema: {_safe_tool_error(e)}"}
     finally:
         conn.close()
 
@@ -239,116 +197,65 @@ def _get_schema_one(parquet_file: str) -> dict:
 @tool
 def get_schema(parquet_files: Union[str, List[str]]) -> str:
     """
-    Get schema information of a parquet file, or a list of parquet files.
+    Get schema information of a table, or a list of tables.
 
     Args:
-        parquet_files: Path to a parquet file, or list of paths for batch lookup
+        parquet_files: Table name or list of table names for batch lookup
 
     Returns:
-        JSON string containing file metadata — single object if one file, list if multiple
+        JSON string containing table metadata — single object if one table, list if multiple
     """
-    # Normalize: some models serialize list args as JSON strings
-    if isinstance(parquet_files, str):
-        stripped = parquet_files.strip()
-        if stripped.startswith("["):
-            try:
-                parquet_files = json.loads(stripped)
-            except (json.JSONDecodeError, ValueError):
-                pass
-        elif stripped.startswith('"') and stripped.endswith('"'):
-            parquet_files = stripped.strip('"')
+    names = _table_names(parquet_files)
+    payload = _get_schema_one(names[0]) if len(names) == 1 else [_get_schema_one(n) for n in names]
+    return _enforce_token_limit(json.dumps(payload, ensure_ascii=False, indent=2), "get_schema")
 
-    if isinstance(parquet_files, str):
-        result_json = json.dumps(_get_schema_one(parquet_files), ensure_ascii=False, indent=2)
-    else:
-        result_json = json.dumps([_get_schema_one(f) for f in parquet_files], ensure_ascii=False, indent=2)
-
-    return _enforce_token_limit(result_json, "get_schema")
 
 @tool
 def query_parquet_files(parquet_files: Union[str, List[str]], query: str, limit: int = 10) -> str:
     """
-    Query parquet files using SQL syntax for data analysis and exploration.
-    
+    Query telemetry tables using SQL syntax for data analysis and exploration.
+
     Args:
-        parquet_files: Path(s) to parquet file(s)
-        query: SQL query to execute
+        parquet_files: Table name(s) returned by list_tables_in_directory
+        query: SQL query to execute; each table is available under its own name
         limit: Maximum number of records to return
-        
+
     Returns:
         JSON string of query results
     """
     duckdb = _import_duckdb()
-    try:
-        parquet_files = _validate_parquet_files(parquet_files)
-    except FileNotFoundError as e:
-        return json.dumps({"error": str(e)})
-
+    names = _table_names(parquet_files)
     conn = duckdb.connect(":memory:")
-    table_names: set = set()
-
     try:
-        # Convert absolute paths to relative paths where possible
-        cwd = Path.cwd()
-        relative_parquet_files = []
-        for file_path in parquet_files:
-            file_path_obj = Path(file_path)
-            if file_path_obj.is_absolute():
-                try:
-                    file_path = str(file_path_obj.relative_to(cwd))
-                except ValueError:
-                    # File is not under cwd (e.g., temp files), use absolute path
-                    file_path = str(file_path_obj)
-            relative_parquet_files.append(file_path)
-        parquet_files = relative_parquet_files
-
-        # Register parquet files as views using filename as table name
-        for file_path in parquet_files:
-            base_name = Path(file_path).stem
-            table_name = base_name
-            counter = 1
-            while table_name in table_names:
-                table_name = f"{base_name}_{counter}"
-                counter += 1
-            table_names.add(table_name)
-            select_clause = _build_rename_select(file_path)
-            conn.execute(f"CREATE VIEW {table_name} AS SELECT {select_clause} FROM read_parquet('{file_path}')")
-
-        # Execute query
-        result = conn.execute(query).fetchall()
-        columns = [desc[0] for desc in conn.description]
-
-        # Convert to list of dictionaries and serialize datetime
-        rows = [dict(zip(columns, row)) for row in result]
-        serialized_rows = _serialize_datetime(rows)
-
-        # Apply limit if specified
-        if len(serialized_rows) > limit:
-            serialized_rows = serialized_rows[:limit]
-
-        result_json = json.dumps(serialized_rows, ensure_ascii=False, indent=2)
-        return _enforce_token_limit(result_json, "query_parquet_files")
-
+        for name in names:
+            source = _read_source(_resolve_table(name))
+            conn.execute(f"CREATE VIEW {_quote_identifier(name)} AS "
+                         f"SELECT {_build_rename_select(source)} FROM {source}")
+        cursor = conn.execute(query)
+        columns = [desc[0] for desc in cursor.description]
+        rows = [dict(zip(columns, row)) for row in cursor.fetchmany(max(1, int(limit)))]
+        return _enforce_token_limit(json.dumps(_serialize_datetime(rows), ensure_ascii=False, indent=2, default=str),
+                                    "query_parquet_files")
     except Exception as e:
-        error_msg = str(e)
+        error_msg = _safe_tool_error(e)
         # Provide contextual error messages
         if "syntax error" in error_msg.lower() or "parser error" in error_msg.lower():
             return json.dumps({
                 "error": f"SQL syntax error in query: {error_msg}",
                 "query": query,
-                "available_tables": list(table_names)
+                "available_tables": names
             })
         elif "catalog" in error_msg.lower() or "table" in error_msg.lower():
             return json.dumps({
                 "error": f"Table reference error: {error_msg}",
                 "query": query,
-                "available_tables": list(table_names)
+                "available_tables": names
             })
         else:
             return json.dumps({
                 "error": f"Query execution failed: {error_msg}",
                 "query": query,
-                "available_tables": list(table_names)
+                "available_tables": names
             })
     finally:
         conn.close()

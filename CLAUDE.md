@@ -38,7 +38,7 @@ cp .env.qwen.example .env.qwen      # 填 OPENAI_API_KEY；Claude 模型用 .env
 | openrca_telecom | 51 | trace_span、metric_app、metric_container、metric_middleware、metric_node、metric_service |
 | aiops2025 | 400 | logs、traces、apm_pod、apm_service、apm_namespace、infra_node、infra_pod、infra_tidb、infra_other（均为分片目录） |
 | rca100、rca100_v1 | 103 / 57 | metrics、logs、traces、events、alerts、topology_entities、topology_edges |
-| rcaeval | 735 | re1：metrics（宽表）；re2、re3：另有 logs，ob、tt 子集再加 traces（1 个 re2 tt case 没有 logs） |
+| rcaeval | 735 | re1：metrics（长表：time、service、metric、value）；re2、re3：另有 logs，ob、tt 子集再加 traces（1 个 re2 tt case 没有 logs） |
 
 - **基线**：只有 rcabench_500、rcabench、openrca2 有 `normal_*` 表，其他数据集用事件前的时段作对比。
 - **OpenRCA**：每题只给问题日期（跨午夜时两天）的 CSV 转成的 Parquet，列名不变，时间为 UTC+8。**AIOps2025**：给该 UTC+8 自然日的遥测。

@@ -8,11 +8,13 @@
 
 ## Harness 如何驱动
 
-`python agent_runner.py [--verbose] [--log-file PATH]`，每个 case 一个进程。配置见 `harness/configs/agents/thinkdepthai-qwen.yaml`（`prompts: rca_tables.yaml`），模型由 `RCA_MODEL` 传入。
+`python agent_runner.py [--verbose] [--log-file PATH]`，每个 case 一个进程。配置在 `harness/configs/agents/`：`thinkdepthai-qwen.yaml`（`prompts: rca_tables.yaml`）；`thinkdepthai-cmp.yaml` 是框架对比实验（父仓库 `docs/framework_comparison.md`）：对比用 prompt `rca_compare.yaml`，每个请求经过 harness 的录制网关，不设轮次或工具次数上限。模型由 `RCA_MODEL` 传入。
 
 - stdin：JSON，含 `question`、`system_prompt`、`user_prompt`、`compress_system_prompt`、`compress_user_prompt`、`data_dir`。
-- stdout 最后一行：JSON，含 `output`（CausalGraph JSON 字符串，无效时原样保留）、`graph_valid`、`trajectory`（OpenAI 消息格式）、`usage`。harness 把其他键放进 meta。`trajectory` 只含图节点产生的消息，不含初始 user 消息。
+- stdout 最后一行：JSON，含 `output`（CausalGraph JSON 字符串，无效时原样保留）、`graph_valid`、`trajectory`（OpenAI 消息格式）、`usage`、`run_status`、`stop_reason`（`finish`、`context_length`、`recursion_limit`）、`run_error`。harness 把其他键放进 meta。`trajectory` 只含图节点产生的消息，不含初始 user 消息。
 - 流程：`START -> analyst_call -> (tool_node -> analyst_call)* -> compress_research -> END`，与上游 `research_agent.py` 拓扑相同，递归上限 300。
+- 服务端因上下文长度拒绝请求（HTTP 400，vLLM 的 context length 报错）不是基础设施失败：Analyst 循环在那里结束，synthesis 用已收集的消息照常运行（`run_status=completed`、`stop_reason=context_length`）；synthesis 也被拒绝时，run 以 `failed`、空输出结束。递归上限同样记为失败的 run。退出码都是 0，harness 不重试。
+- 每个请求带 `X-Cairn-Purpose` 头（Analyst 为 `agent`，synthesis 为 `synthesis`），网关据此区分辅助调用；其他端点忽略它。
 - 工具：`think_tool`、`list_tables_in_directory`、`get_schema`、`query_parquet_files`，没有 `tavily_search`。system prompt 是 payload 的 `system_prompt` 加 `rca_think_prompt`。
 
 ## 环境
@@ -25,6 +27,8 @@ cp .env.qwen.example .env.qwen      # 填 OPENAI_API_KEY；Claude 模型用 .env
 - 凭证文件：`RCA_ENV_FILE` 优先；否则 `RCA_MODEL` 以 `claude` 开头读 `.env.sonnet`，其他读 `.env.qwen`；文件不存在时退回 `.env`。已有的环境变量不被覆盖。
 - 依赖 `_rca_shared`（`events`、`usage_tracker`）：默认在上一级目录；单独使用本仓库时，把其父目录设为 `RCA_SHARED_PARENT`。
 - 其他变量：`RCA_EVENTS_DIR`（事件日志，实时写入该目录的 `events.jsonl`）、`RCA_MAX_RETRIES`（OpenAI 分支，默认 6）、`RCA_LLM_EXTRA_BODY`（JSON，透传）、`RCA_FORCE_ANTHROPIC=1`。
+- 输出上限：`RCA_MAX_TOKENS`（Analyst，默认 32768）、`RCA_COMPRESS_MAX_TOKENS`（synthesis，默认 32000）。在 32768 长度的 vLLM 上必须调小（对比实验都是 4096）。
+- 采样：`RCA_TEMPERATURE`（默认 0）、`RCA_TOP_P`、`RCA_TOP_K`、`RCA_PRESENCE_PENALTY`，未设置时不发送；`top_p`、`top_k` 放在 extra body 里（当前 langchain-openai 不发送 `ChatOpenAI(top_p=...)`）。
 
 ## 数据集与表
 

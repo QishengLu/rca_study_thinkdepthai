@@ -3,7 +3,13 @@
 
 stdin:  JSON { question, system_prompt, user_prompt, compress_system_prompt, compress_user_prompt, data_dir }
         data_dir holds the case's telemetry tables: <table>.parquet or <table>/*.parquet.
-stdout: JSON { output (CausalGraph JSON), graph_valid, trajectory (OpenAI format), usage }
+stdout: JSON { output (CausalGraph JSON), graph_valid, trajectory (OpenAI format), usage,
+                run_status, stop_reason, run_error }
+
+Output caps: RCA_MAX_TOKENS for the Analyst (default 32768), RCA_COMPRESS_MAX_TOKENS for the synthesis (default
+32000). A request the server refuses for its context length is not an infrastructure failure: the Analyst loop
+ends there and the synthesis runs on what was gathered; if the synthesis is refused too, the run fails with
+stop_reason context_length and an empty output (exit 0, so the harness stores it instead of retrying).
 """
 import argparse
 import json
@@ -52,11 +58,22 @@ logger = logging.getLogger("agent_runner")
 
 RCA_TOOLS = [think_tool, list_tables_in_directory, get_schema, query_parquet_files]
 RECURSION_LIMIT = 300
+ANALYST_MAX_TOKENS = int(os.environ.get("RCA_MAX_TOKENS", "32768"))
+COMPRESS_MAX_TOKENS = int(os.environ.get("RCA_COMPRESS_MAX_TOKENS", "32000"))
+CONTEXT_MARKERS = ("context length", "maximum context", "prompt is too long", "max_model_len")
+# Why the run stopped other than by the Analyst finishing: set by the graph nodes, read by main().
+RUN: dict = {"stop_reason": None, "error": None}
 
 
-def _make_model(max_tokens: int = 32768):
+def _make_model(max_tokens: int = 32768, purpose: str | None = None):
     """Create the LLM through model_factory; the model name comes from RCA_MODEL."""
-    return create_model(RCA_MODEL, max_tokens=max_tokens)
+    return create_model(RCA_MODEL, max_tokens=max_tokens, purpose=purpose)
+
+
+def is_context_length(exc: Exception) -> bool:
+    """The server refused the request for its context window (HTTP 400 with vLLM's wording)."""
+    status = getattr(exc, "status_code", None) or getattr(getattr(exc, "response", None), "status_code", None)
+    return status == 400 and any(m in str(exc).lower() for m in CONTEXT_MARKERS)
 
 
 def _content_to_text(content) -> str:
@@ -84,12 +101,19 @@ def strip_markdown_json(text: str) -> str:
 # ── graph nodes ──────────────────────────────────────────────────────────────
 
 def make_analyst_call(system_prompt: str, tools: list):
-    model_with_tools = _make_model().bind_tools(tools)
+    model_with_tools = _make_model(ANALYST_MAX_TOKENS, purpose="agent").bind_tools(tools)
 
     def analyst_call(state: ResearcherState) -> dict:
-        with EV.scope(role="analyst"):
-            response = model_with_tools.invoke(
-                [SystemMessage(content=system_prompt)] + list(state["researcher_messages"]))
+        try:
+            with EV.scope(role="analyst"):
+                response = model_with_tools.invoke(
+                    [SystemMessage(content=system_prompt)] + list(state["researcher_messages"]))
+        except Exception as exc:
+            if not is_context_length(exc):
+                raise
+            # The history no longer fits the server's window: stop investigating, synthesize what was gathered.
+            RUN.update(stop_reason="context_length", error=f"analyst: {str(exc)[:500]}")
+            return {}
         return {"researcher_messages": [response]}
 
     return analyst_call
@@ -121,13 +145,19 @@ def make_tool_node(tools: list):
 
 
 def make_compress_research(compress_sp: str, compress_up: str):
-    compress_model = _make_model(max_tokens=32000)
+    compress_model = _make_model(COMPRESS_MAX_TOKENS, purpose="synthesis")
 
     def compress_research(state: ResearcherState) -> dict:
         messages = ([SystemMessage(content=compress_sp)] + list(state.get("researcher_messages", []))
                     + [HumanMessage(content=compress_up)])
-        with EV.scope(role="compress"):
-            response = compress_model.invoke(messages)
+        try:
+            with EV.scope(role="compress"):
+                response = compress_model.invoke(messages)
+        except Exception as exc:
+            if not is_context_length(exc):
+                raise
+            RUN.update(stop_reason="context_length", error=f"synthesis: {str(exc)[:500]}")
+            return {"compressed_research": ""}
         raw_notes = [str(m.content) for m in filter_messages(state["researcher_messages"], include_types=["tool", "ai"])]
         return {"compressed_research": _content_to_text(response.content), "raw_notes": ["\n".join(raw_notes)],
                 "researcher_messages": [response]}
@@ -136,6 +166,8 @@ def make_compress_research(compress_sp: str, compress_up: str):
 
 
 def route_after_analyst(state: ResearcherState) -> str:
+    if RUN["stop_reason"]:
+        return "compress_research"
     if state["researcher_messages"][-1].tool_calls:
         return "tool_node"
     return "compress_research"
@@ -218,19 +250,24 @@ def main() -> None:
     compressed_research = ""
     step = 0
     initial_state = {"researcher_messages": [HumanMessage(content=user_prompt)]}
-    for event in agent.stream(initial_state, config={"recursion_limit": RECURSION_LIMIT}):
-        for node, value in event.items():
-            if not isinstance(value, dict):
-                continue
-            new_messages = list(value.get("researcher_messages") or [])
-            if new_messages:
-                all_messages.extend(new_messages)
-                step += 1
-                for message in new_messages:
-                    calls = [c["name"] for c in (getattr(message, "tool_calls", None) or [])]
-                    logger.info("[step %s] %s %s tool_calls=%s", step, node, type(message).__name__, calls)
-            if "compressed_research" in value:
-                compressed_research = value["compressed_research"]
+    from langgraph.errors import GraphRecursionError
+    try:
+        for event in agent.stream(initial_state, config={"recursion_limit": RECURSION_LIMIT}):
+            for node, value in event.items():
+                if not isinstance(value, dict):
+                    continue
+                new_messages = list(value.get("researcher_messages") or [])
+                if new_messages:
+                    all_messages.extend(new_messages)
+                    step += 1
+                    for message in new_messages:
+                        calls = [c["name"] for c in (getattr(message, "tool_calls", None) or [])]
+                        logger.info("[step %s] %s %s tool_calls=%s", step, node, type(message).__name__, calls)
+                if "compressed_research" in value:
+                    compressed_research = value["compressed_research"]
+    except GraphRecursionError as exc:
+        # The upstream graph's own step limit: a failed run with no answer, not an infrastructure failure.
+        RUN.update(stop_reason="recursion_limit", error=str(exc)[:500])
 
     output = strip_markdown_json(compressed_research)
     try:
@@ -238,6 +275,9 @@ def main() -> None:
         graph_valid = isinstance(parsed, dict) and all(key in parsed for key in ("nodes", "edges", "root_causes"))
     except (json.JSONDecodeError, TypeError):
         graph_valid = False
+    # The Analyst finished, or the window cut it short and the synthesis still produced an answer: completed.
+    # No answer because the synthesis was refused too, or the recursion limit: failed.
+    failed = RUN["stop_reason"] == "recursion_limit" or (RUN["stop_reason"] == "context_length" and not output)
     EV.artifact("final_graph", {"output": output, "graph_valid": graph_valid})
     # Single line: the harness parses the last stdout line.
     print(json.dumps({
@@ -245,6 +285,9 @@ def main() -> None:
         "graph_valid": graph_valid,
         "trajectory": convert_trajectory(all_messages),
         "usage": _tracker.get_usage(),  # the SDK hook sees Analyst and synthesis calls
+        "run_status": "failed" if failed else "completed",
+        "stop_reason": RUN["stop_reason"] or "finish",
+        "run_error": RUN["error"],
     }, ensure_ascii=False))
 
 

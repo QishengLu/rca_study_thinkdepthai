@@ -17,11 +17,14 @@ import os
 from langchain_core.language_models import BaseChatModel
 
 
-def create_model(model_name: str, *, max_tokens: int = 32768) -> BaseChatModel:
+def create_model(model_name: str, *, max_tokens: int = 32768, purpose: str | None = None) -> BaseChatModel:
     """根据 model_name 创建 LangChain ChatModel。
 
     Claude -> ChatAnthropic; every other model -> ChatOpenAI (OpenAI-compatible endpoint).
+    `purpose` (e.g. "agent", "synthesis") is sent as the X-Cairn-Purpose header, which Cairn's comparison gateway
+    records with each call; other endpoints ignore it.
     """
+    headers = {"X-Cairn-Purpose": purpose} if purpose else None
     api_key = os.environ["OPENAI_API_KEY"]
     base_url = os.environ["OPENAI_BASE_URL"]   # endpoint from the agent's .env
 
@@ -44,6 +47,7 @@ def create_model(model_name: str, *, max_tokens: int = 32768) -> BaseChatModel:
             base_url=anthropic_url,
             max_tokens=max_tokens,
             max_retries=8,
+            **({"default_headers": headers} if headers else {}),
         )
     else:
         from langchain_openai import ChatOpenAI
@@ -51,13 +55,25 @@ def create_model(model_name: str, *, max_tokens: int = 32768) -> BaseChatModel:
         # Transport only: ride out short 429/5xx bursts under concurrent runs
         # (SDK default is 2 retries). RCA_MAX_RETRIES overrides. RCA_LLM_EXTRA_BODY (JSON, e.g.
         # {"enable_thinking": false}) is passed through when set, as _rca_shared/llm.py does.
-        extra = os.environ.get("RCA_LLM_EXTRA_BODY")
+        # Sampling: temperature 0 unless RCA_TEMPERATURE is set; RCA_TOP_P, RCA_PRESENCE_PENALTY and RCA_TOP_K
+        # (vLLM's top_k; top_k and top_p go in the extra body) only when set, so a comparison can match another
+        # framework's sampling on the same backbone.
+        extra = json.loads(os.environ["RCA_LLM_EXTRA_BODY"]) if os.environ.get("RCA_LLM_EXTRA_BODY") else {}
+        if os.environ.get("RCA_TOP_K"):
+            extra["top_k"] = int(os.environ["RCA_TOP_K"])
+        if os.environ.get("RCA_TOP_P"):
+            # In the extra body: this langchain-openai leaves ChatOpenAI(top_p=...) out of the request.
+            extra["top_p"] = float(os.environ["RCA_TOP_P"])
+        sampling = {"temperature": float(os.environ.get("RCA_TEMPERATURE", "0"))}
+        if os.environ.get("RCA_PRESENCE_PENALTY"):
+            sampling["presence_penalty"] = float(os.environ["RCA_PRESENCE_PENALTY"])
         return ChatOpenAI(
             model=model_name,
             api_key=api_key,
             base_url=base_url,
             max_tokens=max_tokens,
-            temperature=0,
             max_retries=int(os.environ.get("RCA_MAX_RETRIES", "6")),
-            **({"extra_body": json.loads(extra)} if extra else {}),
+            **sampling,
+            **({"extra_body": extra} if extra else {}),
+            **({"default_headers": headers} if headers else {}),
         )

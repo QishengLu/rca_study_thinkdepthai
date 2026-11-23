@@ -40,7 +40,19 @@ class FakeModel:
 
     def invoke(self, messages):
         self.seen.append(list(messages))
-        return self.script.pop(0)
+        step = self.script.pop(0)
+        if isinstance(step, Exception):
+            raise step
+        return step
+
+
+class ContextLengthError(Exception):
+    """What the OpenAI SDK raises for vLLM's refusal of an over-long request (HTTP 400)."""
+    status_code = 400
+
+    def __init__(self):
+        super().__init__("Error code: 400 - This model's maximum context length is 32768 tokens. However, you "
+                         "requested 4096 output tokens and your prompt contains at least 28700 input tokens.")
 
 
 def call(name, call_id, **args):
@@ -74,7 +86,7 @@ def run_case(data_dir: str) -> None:
         AIMessage(content="Root cause: payment."),
         AIMessage(content="```json\n" + json.dumps(graph) + "\n```"),
     ])
-    runner._make_model = lambda max_tokens=32768: model
+    runner._make_model = lambda max_tokens=32768, purpose=None: model
     payload = {"question": "q", "system_prompt": "SP", "user_prompt": "UP", "compress_system_prompt": "CSP",
                "compress_user_prompt": "CUP", "data_dir": data_dir}
     sys.stdin = io.StringIO(json.dumps(payload))
@@ -83,8 +95,10 @@ def run_case(data_dir: str) -> None:
         runner.main()
     result = json.loads(stdout.getvalue().strip().splitlines()[-1])
 
-    assert set(result) == {"output", "graph_valid", "trajectory", "usage"}, set(result)
+    assert set(result) == {"output", "graph_valid", "trajectory", "usage", "run_status", "stop_reason",
+                           "run_error"}, set(result)
     assert result["graph_valid"] is True and json.loads(result["output"]) == graph
+    assert result["run_status"] == "completed" and result["stop_reason"] == "finish"
     assert not model.script, "the fake model was not called to the end of its script"
     assert model.bound == [["think_tool", "list_tables_in_directory", "get_schema", "query_parquet_files"]]
 
@@ -107,8 +121,33 @@ def run_case(data_dir: str) -> None:
     print(f"case OK: {len(tables)} tables, first {first!r}: {data_dir}")
 
 
+def run_overflow(data_dir: str, synthesis_fits: bool) -> None:
+    """The server refuses an Analyst request for its context length: synthesis on what was gathered, or a failed
+    run with no answer when the synthesis is refused too. Never an infrastructure failure (exit 0)."""
+    os.environ["RCA_CASE_DATA_DIR"] = data_dir
+    runner.RUN.update(stop_reason=None, error=None)
+    graph = {"nodes": [], "edges": [], "root_causes": [{"component": "payment", "state": "UNAVAILABLE"}]}
+    model = FakeModel([call("list_tables_in_directory", "c1", directory="."), ContextLengthError(),
+                       AIMessage(content=json.dumps(graph)) if synthesis_fits else ContextLengthError()])
+    runner._make_model = lambda max_tokens=32768, purpose=None: model
+    sys.stdin = io.StringIO(json.dumps({"question": "q", "system_prompt": "SP", "user_prompt": "UP",
+                                        "compress_system_prompt": "CSP", "compress_user_prompt": "CUP",
+                                        "data_dir": data_dir}))
+    stdout = io.StringIO()
+    with contextlib.redirect_stdout(stdout):
+        runner.main()
+    result = json.loads(stdout.getvalue().strip().splitlines()[-1])
+    assert result["stop_reason"] == "context_length" and not model.script
+    if synthesis_fits:
+        assert result["run_status"] == "completed" and result["graph_valid"] is True
+    else:
+        assert result["run_status"] == "failed" and result["output"] == "" and "synthesis" in result["run_error"]
+    assert [m["role"] for m in result["trajectory"]] == ["assistant", "tool"] + (["assistant"] if synthesis_fits else [])
+    runner.RUN.update(stop_reason=None, error=None)
+
+
 # The graph: start -> analyst -> (tools -> analyst)* -> synthesis -> end.
-runner._make_model = lambda max_tokens=32768: FakeModel([])
+runner._make_model = lambda max_tokens=32768, purpose=None: FakeModel([])
 assert set(runner.build_agent("SP", "CSP", "CUP").get_graph().nodes) == {
     "__start__", "analyst_call", "tool_node", "compress_research", "__end__"}
 route = runner.route_after_analyst
@@ -126,5 +165,7 @@ else:
         os.environ["RCA_CASE_DATA_DIR"] = tmp
         assert list(sandbox_tables()) == ["abnormal_traces", "logs"]
         run_case(tmp)
+        run_overflow(tmp, synthesis_fits=True)
+        run_overflow(tmp, synthesis_fits=False)
 
-print("offline smoke OK: Analyst tools, graph, routing, stdout contract and trajectory")
+print("offline smoke OK: Analyst tools, graph, routing, stdout contract, trajectory and context-length stops")

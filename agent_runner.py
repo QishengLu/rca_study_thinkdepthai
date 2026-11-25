@@ -48,7 +48,7 @@ EV.install_openai_hooks()
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage, filter_messages  # noqa: E402
 from langgraph.graph import END, START, StateGraph  # noqa: E402
 
-from deep_research.prompts import rca_think_prompt  # noqa: E402
+from deep_research.prompts import rca_telemetry_prompt, rca_think_prompt  # noqa: E402
 from deep_research.rca_tools import get_schema, list_tables_in_directory, query_parquet_files  # noqa: E402
 from deep_research.state_research import ResearcherState  # noqa: E402
 from deep_research.utils import think_tool  # noqa: E402
@@ -144,20 +144,48 @@ def make_tool_node(tools: list):
     return tool_node
 
 
+def valid_graph(text):
+    try:
+        graph = json.loads(strip_markdown_json(text))
+    except (TypeError, ValueError):
+        return False
+    return isinstance(graph, dict) and all(k in graph for k in ("nodes", "edges", "root_causes"))
+
+
+def compact_tool_evidence(messages):
+    # Keep tool IDs paired with calls and retain both ends of large table results.
+    compact = []
+    for message in messages:
+        content = message.content
+        if isinstance(message, ToolMessage) and isinstance(content, str) and len(content) > 2048:
+            message = message.model_copy(update={"content": content[:1024] + "\n[rows omitted]\n" + content[-1024:]})
+        compact.append(message)
+    return compact
+
+
 def make_compress_research(compress_sp: str, compress_up: str):
     compress_model = _make_model(COMPRESS_MAX_TOKENS, purpose="synthesis")
 
     def compress_research(state: ResearcherState) -> dict:
         messages = ([SystemMessage(content=compress_sp)] + list(state.get("researcher_messages", []))
                     + [HumanMessage(content=compress_up)])
-        try:
-            with EV.scope(role="compress"):
+        with EV.scope(role="compress"):
+            try:
                 response = compress_model.invoke(messages)
-        except Exception as exc:
-            if not is_context_length(exc):
-                raise
-            RUN.update(stop_reason="context_length", error=f"synthesis: {str(exc)[:500]}")
-            return {"compressed_research": ""}
+            except Exception as exc:
+                if not is_context_length(exc):
+                    raise
+                try:
+                    messages = compact_tool_evidence(messages)
+                    response = compress_model.invoke(messages)
+                except Exception as retry_exc:
+                    if not is_context_length(retry_exc):
+                        raise
+                    RUN.update(stop_reason="context_length", error=f"synthesis: {str(retry_exc)[:500]}")
+                    return {"compressed_research": ""}
+            draft = _content_to_text(response.content)
+            if draft.strip() and not valid_graph(draft):
+                response = compress_model.invoke(messages)
         raw_notes = [str(m.content) for m in filter_messages(state["researcher_messages"], include_types=["tool", "ai"])]
         return {"compressed_research": _content_to_text(response.content), "raw_notes": ["\n".join(raw_notes)],
                 "researcher_messages": [response]}
@@ -239,10 +267,8 @@ def main() -> None:
 
     payload = json.loads(sys.stdin.read())
     os.environ["RCA_CASE_DATA_DIR"] = payload["data_dir"]
-    user_prompt = (f"{payload['user_prompt']}\n\n## Telemetry Tables\n\n"
-                   'Start by calling `list_tables_in_directory(directory=".")` '
-                   "to discover available table names. Pass table names to the other tools.")
-    combined_sp = payload["system_prompt"] + "\n\n---\n\n" + rca_think_prompt
+    user_prompt = payload["user_prompt"] + "\n\n" + payload.get("rca_telemetry_prompt", rca_telemetry_prompt)
+    combined_sp = payload["system_prompt"] + "\n\n---\n\n" + payload.get("rca_think_prompt", rca_think_prompt)
 
     agent = build_agent(combined_sp, payload["compress_system_prompt"], payload["compress_user_prompt"])
 
@@ -265,19 +291,19 @@ def main() -> None:
                         logger.info("[step %s] %s %s tool_calls=%s", step, node, type(message).__name__, calls)
                 if "compressed_research" in value:
                     compressed_research = value["compressed_research"]
-    except GraphRecursionError as exc:
-        # The upstream graph's own step limit: a failed run with no answer, not an infrastructure failure.
-        RUN.update(stop_reason="recursion_limit", error=str(exc)[:500])
+    except GraphRecursionError:
+        # Use the collected evidence for one final synthesis after the investigation budget.
+        RUN.update(stop_reason="recursion_limit_synthesis", error=None)
+        synthesize = make_compress_research(payload["compress_system_prompt"], payload["compress_user_prompt"])
+        final = synthesize({"researcher_messages": [*initial_state["researcher_messages"], *all_messages]})
+        compressed_research = final["compressed_research"]
+        all_messages.extend(final.get("researcher_messages", []))
 
     output = strip_markdown_json(compressed_research)
-    try:
-        parsed = json.loads(output)
-        graph_valid = isinstance(parsed, dict) and all(key in parsed for key in ("nodes", "edges", "root_causes"))
-    except (json.JSONDecodeError, TypeError):
-        graph_valid = False
-    # The Analyst finished, or the window cut it short and the synthesis still produced an answer: completed.
-    # No answer because the synthesis was refused too, or the recursion limit: failed.
-    failed = RUN["stop_reason"] == "recursion_limit" or (RUN["stop_reason"] == "context_length" and not output)
+    graph_valid = valid_graph(output)
+    failed = not graph_valid
+    if not graph_valid and not RUN["stop_reason"]:
+        RUN.update(stop_reason="invalid_graph", error="Synthesis did not return a valid graph JSON")
     EV.artifact("final_graph", {"output": output, "graph_valid": graph_valid})
     # Single line: the harness parses the last stdout line.
     print(json.dumps({

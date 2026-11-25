@@ -129,6 +129,8 @@ def run_overflow(data_dir: str, synthesis_fits: bool) -> None:
     graph = {"nodes": [], "edges": [], "root_causes": [{"component": "payment", "state": "UNAVAILABLE"}]}
     model = FakeModel([call("list_tables_in_directory", "c1", directory="."), ContextLengthError(),
                        AIMessage(content=json.dumps(graph)) if synthesis_fits else ContextLengthError()])
+    if not synthesis_fits:
+        model.script.append(ContextLengthError())  # The compacted synthesis request also exceeds the window.
     runner._make_model = lambda max_tokens=32768, purpose=None: model
     sys.stdin = io.StringIO(json.dumps({"question": "q", "system_prompt": "SP", "user_prompt": "UP",
                                         "compress_system_prompt": "CSP", "compress_user_prompt": "CUP",

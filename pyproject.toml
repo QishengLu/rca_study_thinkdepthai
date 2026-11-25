@@ -17,6 +17,7 @@ dependencies = [
     "ipykernel>=6.20.0",
     "tavily-python>=0.5.0",
     "duckdb>=1.4.2",
+    "pyyaml>=6",
     "pytz>=2025.2",
     "python-dotenv>=1.2.1",
 ]
@@ -35,7 +36,7 @@ packages = ["deep_research"]
 "deep_research" = "src"
 
 [tool.setuptools.package-data]
-"*" = ["py.typed"]
+"*" = ["py.typed", "prompts.yaml", "prompts_old.yaml"]
 
 [tool.ruff]
 lint.select = [

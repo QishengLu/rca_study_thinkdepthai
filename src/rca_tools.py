@@ -6,6 +6,14 @@ from typing import Union, List
 from langchain_core.tools import tool
 
 TOKEN_LIMIT = 5000
+# Native time columns a table's uniform `ts` column is derived from, most preferred first (lowercase). The rule is
+# Aiops_Context's (aiops_context/backends/sql.py), so both frameworks see the same `ts` and the incident's ISO
+# fault_window can be compared with it directly: nobody does epoch arithmetic in their head.
+TIME_COLUMNS = ("time", "timestamp", "@timestamp", "_time_", "starttime", "start_time", "starttimemillis")
+# Epoch magnitude -> unit and its factor to microseconds (negative: divide). Smaller values are not epochs.
+EPOCH_UNITS = ((1e11, "s", 1_000_000), (1e14, "ms", 1000), (1e17, "us", 1), (1e20, "ns", -1000))
+MIN_EPOCH = 1e8
+_TS_CACHE: dict = {}
 
 def _import_duckdb():
     """Import duckdb with helpful error message."""
@@ -16,6 +24,13 @@ def _import_duckdb():
         raise ImportError(
             "duckdb is required. Install it with: pip install duckdb"
         )
+
+
+def _connect():
+    """An in-memory connection that shows and compares timestamps in UTC, the zone of fault_window."""
+    conn = _import_duckdb().connect(":memory:")
+    conn.execute("SET TimeZone='UTC'")
+    return conn
 
 def _serialize_datetime(obj):
     """Convert datetime objects to ISO format strings for JSON serialization"""
@@ -118,17 +133,72 @@ def _quote_identifier(name: str) -> str:
     return '"' + name.replace('"', '""') + '"'
 
 
-def _build_rename_select(source: str) -> str:
-    """SELECT clause that renames dot-containing columns, or '*' if none needs it."""
-    duckdb = _import_duckdb()
-    conn = duckdb.connect(":memory:")
-    try:
-        columns = [desc[0] for desc in conn.execute(f"SELECT * FROM {source} LIMIT 0").description]
-    finally:
-        conn.close()
-    if not any("." in col for col in columns):
-        return "*"
-    return ", ".join(f"{_quote_identifier(col)} AS {_quote_identifier(_sanitize_column_name(col))}" for col in columns)
+def _sql_text(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _time_expression(conn, source: str, column: str, kind: str):
+    """SQL for a TIMESTAMPTZ (UTC) from one native time column, and how it was read; None if it is no time."""
+    q = _quote_identifier(column)
+    if kind.startswith("TIMESTAMP"):
+        return f"CAST({q} AS TIMESTAMPTZ)", "timestamp"
+    sample = [r[0] for r in conn.execute(f"SELECT {q} FROM {source} WHERE {q} IS NOT NULL LIMIT 200").fetchall()]
+    if not sample:
+        return None
+    numbers = []
+    for value in sample:
+        try:
+            numbers.append(float(value))
+        except (TypeError, ValueError):
+            break
+    if len(numbers) == len(sample):
+        unit, factor = next(((u, f) for bound, u, f in EPOCH_UNITS if max(numbers) < bound), (None, None))
+        if unit is None or min(numbers) < MIN_EPOCH:
+            return None
+        # Integers (also digit strings such as nanosecond VARCHARs) stay exact; DOUBLE keeps its fraction.
+        integral = "INT" in kind or (kind == "VARCHAR" and all(str(v).isdigit() for v in sample))
+        value = f"TRY_CAST({q} AS {'BIGINT' if integral else 'DOUBLE'})"
+        scaled = f"{value} * {factor}" if factor > 0 else f"{value} / {-factor}"
+        micros = scaled if integral and factor > 0 else f"CAST({scaled} AS BIGINT)"
+        return f"make_timestamp({micros})::TIMESTAMPTZ", f"epoch {unit}"
+    if kind == "VARCHAR":
+        parsed = conn.execute(f"SELECT count(TRY_CAST(v AS TIMESTAMPTZ)) FROM (VALUES "
+                              + ", ".join(f"({_sql_text(str(v))})" for v in sample) + ") t(v)").fetchone()[0]
+        if parsed == len(sample):
+            return f"TRY_CAST({q} AS TIMESTAMPTZ)", "ISO text"
+    return None
+
+
+def _ts_column(conn, files: list[str], source: str, columns: list[tuple[str, str]]):
+    """(SQL, description) of the table's uniform ts column, or None: the first native time column, by
+    TIME_COLUMNS, that reads as a time. A table that already has a ts column keeps it."""
+    if any(_sanitize_column_name(c).lower() == "ts" for c, _ in columns):
+        return None
+    key = tuple(files)
+    if key not in _TS_CACHE:
+        native = {c.lower(): (c, k) for c, k in columns}
+        found = None
+        for candidate in TIME_COLUMNS:
+            if candidate in native:
+                column, kind = native[candidate]
+                derived = _time_expression(conn, source, column, kind)
+                if derived:
+                    found = (derived[0], f"{_sanitize_column_name(column)} ({derived[1]})")
+                    break
+        _TS_CACHE[key] = found
+    return _TS_CACHE[key]
+
+
+def _table_select(conn, files: list[str], source: str):
+    """SELECT list of a table's view: ts first when derivable, then every column (dots renamed to underscores);
+    and the ts description or None."""
+    columns = [(r[0], str(r[1])) for r in conn.execute(f"DESCRIBE SELECT * FROM {source}").fetchall()]
+    if any("." in c for c, _ in columns):
+        body = ", ".join(f"{_quote_identifier(c)} AS {_quote_identifier(_sanitize_column_name(c))}" for c, _ in columns)
+    else:
+        body = "*"
+    ts = _ts_column(conn, files, source, columns)
+    return (f"{ts[0]} AS ts, {body}" if ts else body), (ts[1] if ts else None)
 
 
 def _table_names(tables: Union[str, List[str]]) -> List[str]:
@@ -156,16 +226,16 @@ def list_tables_in_directory(directory: str = ".") -> str:
     Returns:
         JSON string containing table names and metadata
     """
-    duckdb = _import_duckdb()
     if directory not in (".", "", "tables"):
         return json.dumps({"error": "Use directory='.' for the current case"})
     files_info = []
     for name, files in sandbox_tables().items():
-        conn = duckdb.connect(":memory:")
+        conn = _connect()
         try:
             source = _read_source(files)
             row_count = conn.execute(f"SELECT COUNT(*) FROM {source}").fetchone()[0]
-            column_count = len(conn.execute(f"SELECT * FROM {source} LIMIT 0").description)
+            select, _ = _table_select(conn, files, source)
+            column_count = len(conn.execute(f"SELECT {select} FROM {source} LIMIT 0").description)
             files_info.append({"table": name, "row_count": row_count, "column_count": column_count})
         except Exception as e:
             files_info.append({"table": name, "error": _safe_tool_error(e)})
@@ -175,19 +245,25 @@ def list_tables_in_directory(directory: str = ".") -> str:
 
 
 def _get_schema_one(table: str) -> dict:
-    """Schema of one table."""
-    duckdb = _import_duckdb()
+    """Schema of one table; with a ts column, where it comes from and the UTC span it covers."""
     try:
         files = _resolve_table(table)
     except ValueError as exc:
         return {"error": str(exc)}
-    conn = duckdb.connect(":memory:")
+    conn = _connect()
     try:
         source = _read_source(files)
-        schema = [{"name": _sanitize_column_name(desc[0]), "type": str(desc[1])}
-                  for desc in conn.execute(f"SELECT * FROM {source} LIMIT 0").description]
-        return {"table": table, "row_count": conn.execute(f"SELECT COUNT(*) FROM {source}").fetchone()[0],
-                "columns": schema}
+        select, ts_from = _table_select(conn, files, source)
+        view = f"(SELECT {select} FROM {source})"
+        schema = [{"name": name, "type": str(kind)}
+                  for name, kind, *_ in conn.execute(f"DESCRIBE SELECT * FROM {view}").fetchall()]
+        result = {"table": table, "row_count": conn.execute(f"SELECT COUNT(*) FROM {source}").fetchone()[0],
+                  "columns": schema}
+        if ts_from:
+            lo, hi = conn.execute(f"SELECT min(ts), max(ts) FROM {view}").fetchone()
+            result["ts_from"] = ts_from
+            result["ts_range"] = [_serialize_datetime(lo), _serialize_datetime(hi)]
+        return result
     except Exception as e:
         return {"error": f"Failed to extract schema: {_safe_tool_error(e)}"}
     finally:
@@ -198,6 +274,9 @@ def _get_schema_one(table: str) -> dict:
 def get_schema(parquet_files: Union[str, List[str]]) -> str:
     """
     Get schema information of a table, or a list of tables.
+
+    A table with a time column also has `ts` (TIMESTAMP WITH TIME ZONE, UTC) as its first column, derived from
+    the native column named in `ts_from`; `ts_range` is the earliest and latest `ts`.
 
     Args:
         parquet_files: Table name or list of table names for batch lookup
@@ -215,6 +294,9 @@ def query_parquet_files(parquet_files: Union[str, List[str]], query: str, limit:
     """
     Query telemetry tables using SQL syntax for data analysis and exploration.
 
+    Filter time with the `ts` column (UTC) and ISO 8601 strings, e.g. WHERE ts >= '2021-03-04T06:30:00Z';
+    timestamps in results are UTC.
+
     Args:
         parquet_files: Table name(s) returned by list_tables_in_directory
         query: SQL query to execute; each table is available under its own name
@@ -223,14 +305,14 @@ def query_parquet_files(parquet_files: Union[str, List[str]], query: str, limit:
     Returns:
         JSON string of query results
     """
-    duckdb = _import_duckdb()
     names = _table_names(parquet_files)
-    conn = duckdb.connect(":memory:")
+    conn = _connect()
     try:
         for name in names:
-            source = _read_source(_resolve_table(name))
-            conn.execute(f"CREATE VIEW {_quote_identifier(name)} AS "
-                         f"SELECT {_build_rename_select(source)} FROM {source}")
+            files = _resolve_table(name)
+            source = _read_source(files)
+            select, _ = _table_select(conn, files, source)
+            conn.execute(f"CREATE VIEW {_quote_identifier(name)} AS SELECT {select} FROM {source}")
         cursor = conn.execute(query)
         columns = [desc[0] for desc in cursor.description]
         rows = [dict(zip(columns, row)) for row in cursor.fetchmany(max(1, int(limit)))]

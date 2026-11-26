@@ -158,10 +158,33 @@ assert route({"researcher_messages": [AIMessage(content="", tool_calls=[
 assert route({"researcher_messages": [AIMessage(content="done")]}) == "compress_research"
 assert runner.to_openai_message(ToolMessage(content="r", name="get_schema", tool_call_id="x"))["agent"] == "analyst"
 
+def run_ts(root: Path) -> None:
+    """Every table with a time column gets a UTC ts first, so the ISO fault_window filters it directly."""
+    from deep_research import rca_tools
+    conn = duckdb.connect(":memory:")
+    conn.execute(f"COPY (SELECT 1614839400 + 60 * i AS timestamp, i AS v FROM range(3) t(i)) "
+                 f"TO '{root / 'metric_s.parquet'}'")                        # epoch seconds (OpenRCA metrics)
+    conn.execute(f"COPY (SELECT 1614839400000 + 60000 * i AS timestamp FROM range(3) t(i)) "
+                 f"TO '{root / 'trace_ms.parquet'}'")                         # epoch milliseconds (OpenRCA traces)
+    conn.execute(f"COPY (SELECT '2021-03-04T14:30:00+08:00' AS _time_) TO '{root / 'log_iso.parquet'}'")
+    conn.close()
+    os.environ["RCA_CASE_DATA_DIR"] = str(root)
+    schemas = json.loads(rca_tools.get_schema.invoke({"parquet_files": ["metric_s", "trace_ms", "log_iso"]}))
+    assert [s["columns"][0]["name"] for s in schemas] == ["ts"] * 3, schemas
+    assert [s["ts_from"] for s in schemas] == ["timestamp (epoch s)", "timestamp (epoch ms)", "_time_ (ISO text)"]
+    assert all(s["ts_range"][0].startswith("2021-03-04T06:30:00") for s in schemas), schemas
+    for table in ("metric_s", "trace_ms", "log_iso"):
+        rows = json.loads(rca_tools.query_parquet_files.invoke({"parquet_files": table, "query":
+            f"SELECT count(*) AS n FROM {table} WHERE ts >= '2021-03-04T06:30:00Z' AND ts < '2021-03-04T06:31:00Z'"}))
+        assert rows == [{"n": 1}], (table, rows)
+
+
 if CASE_ARGS:
     for case in CASE_ARGS:
         run_case(case)
 else:
+    with tempfile.TemporaryDirectory() as tmp:
+        run_ts(Path(tmp))
     with tempfile.TemporaryDirectory() as tmp:
         write_case(Path(tmp))
         os.environ["RCA_CASE_DATA_DIR"] = tmp

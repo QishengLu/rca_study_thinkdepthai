@@ -45,6 +45,7 @@ cp .env.qwen.example .env.qwen      # 填 OPENAI_API_KEY；Claude 模型用 .env
 | rcaeval | 735 | re1：metrics（长表：time、service、metric、value）；re2、re3：另有 logs，ob、tt 子集再加 traces（1 个 re2 tt case 没有 logs） |
 
 - **基线**：只有 rcabench_500、rcabench、openrca2 有 `normal_*` 表，其他数据集用事件前的时段作对比。
+- **`ts` 列**：有时间列的表在视图里多一列 `ts`（TIMESTAMPTZ，UTC，排第一），规则与 Aiops_Context 的 SQL 后端相同：按 `TIME_COLUMNS` 的优先级选原生列，TIMESTAMP 直接转换，epoch 按量级判断秒、毫秒、微秒、纳秒（含存成 VARCHAR 的数字），ISO 文本按自带时区解析，小于 1e8 的数值不当 epoch。`get_schema` 给出 `ts_from`（来源列和单位）和 `ts_range`（最早、最晚的 `ts`），连接时区固定为 UTC，原生列不变。这样模型可以直接拿 incident 里 ISO 格式的 `fault_window` 过滤：没有这一列时，OpenRCA 只有 BIGINT epoch、又是整天数据，2026-11-25 的 baseline 里 Bank 有 72% 的 case 第一次时间过滤就把 epoch 算错了，而且因为仍有数据返回，模型察觉不到。
 - **OpenRCA**：每题只给问题日期（跨午夜时两天）的 CSV 转成的 Parquet，列名不变，时间为 UTC+8。**AIOps2025**：给该 UTC+8 自然日的遥测。
 - **RCA100 列**：沿用原始列，只有 `topology.json` 被转成两张 `topology_*` 表。`traces.startTime`、`duration` 是 VARCHAR 存的纳秒值，比较前要 cast；`logs._time_` 是 RFC 3339 字符串（+08:00）；`metrics.time` 是微秒 BIGINT；`events` 的内容在 `eventId` 的 JSON 里。
 - **RCA100 缺口**：`traces`、`logs` 是分段采样，大约每 5 分钟一段。告警窗口内没有 traces：t103；没有 logs：rca100 的 t085、t094。rca100_v1 中 `k8s.node`、`k8s.deployment`、`k8s.namespace`、`k8s.cluster` 指标的 `entity_name` 全为空，节点名只能从 logs、traces 或 events 取得。

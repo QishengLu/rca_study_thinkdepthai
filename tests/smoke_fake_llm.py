@@ -179,12 +179,37 @@ def run_ts(root: Path) -> None:
         assert rows == [{"n": 1}], (table, rows)
 
 
+def run_limits(root: Path) -> None:
+    """30 rows by default; rows left out by `limit` or by the size limit are said so, and the rows that fit are
+    still returned. The query's own LIMIT is no truncation."""
+    from deep_research import rca_tools
+    conn = duckdb.connect(":memory:")
+    conn.execute(f"COPY (SELECT i, repeat('x', 1000) AS pad FROM range(100) t(i)) TO '{root / 'wide.parquet'}'")
+    conn.execute(f"COPY (SELECT repeat('y', 40000) AS huge) TO '{root / 'huge.parquet'}'")
+    conn.close()
+    os.environ["RCA_CASE_DATA_DIR"] = str(root)
+    q = lambda table, sql, **kw: json.loads(rca_tools.query_parquet_files.invoke(
+        {"parquet_files": table, "query": sql, **kw}))
+    small = q("wide", "SELECT i FROM wide ORDER BY i")
+    assert small["note"] == "Result truncated: 30 rows returned (indexes 0 to 29)." and len(small["rows"]) == 30
+    assert q("wide", "SELECT i FROM wide ORDER BY i", limit=5)["note"].startswith("Result truncated: 5 rows")
+    assert q("wide", "SELECT i FROM wide ORDER BY i LIMIT 3") == [{"i": 0}, {"i": 1}, {"i": 2}]
+    padded = q("wide", "SELECT i, pad FROM wide ORDER BY i")
+    assert 0 < len(padded["rows"]) < 30 and padded["note"] == (
+        f"Result truncated: {len(padded['rows'])} rows returned (indexes 0 to {len(padded['rows']) - 1}).")
+    assert len(json.dumps(padded, indent=2)) <= rca_tools.TOKEN_LIMIT * 3
+    huge = q("huge", "SELECT huge FROM huge")
+    assert huge["rows"] == [] and "first row alone exceeds" in huge["note"]
+
+
 if CASE_ARGS:
     for case in CASE_ARGS:
         run_case(case)
 else:
     with tempfile.TemporaryDirectory() as tmp:
         run_ts(Path(tmp))
+    with tempfile.TemporaryDirectory() as tmp:
+        run_limits(Path(tmp))
     with tempfile.TemporaryDirectory() as tmp:
         write_case(Path(tmp))
         os.environ["RCA_CASE_DATA_DIR"] = tmp

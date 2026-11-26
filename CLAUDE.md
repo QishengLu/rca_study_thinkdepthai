@@ -61,5 +61,5 @@ cp .env.qwen.example .env.qwen      # 填 OPENAI_API_KEY；Claude 模型用 .env
 ## 注意
 
 - `data_dir` 下的每个 parquet 都会暴露给模型。不要指向原始 case 目录：例如 RCABench 的 `converted/` 含 `conclusion.parquet`，会被当成表。
-- 工具结果超过约 5000 token（按 3 字符/token 估算）时，返回错误和建议的 LIMIT，不返回截断数据。`query_parquet_files` 的 `limit` 默认 10，在工具层截断，与 SQL 里的 LIMIT 无关。
+- `query_parquet_files` 的 `limit` 默认 30（与 Aiops_Context 相同），在工具层截断，与 SQL 里的 LIMIT 无关；多取一行判断是否截断。结果超过约 5000 token（按 3 字符/token 估算）时返回放得下的整行。两种截断都把结果写成 `{"note": "Result truncated: K rows returned (indexes 0 to K-1).", "rows": [...]}`，第一行就放不下时 note 说明这一点（不会被当成空结果）；没有截断时仍是行的列表。SQL 自带的 LIMIT 不算截断。`list_tables_in_directory`、`get_schema` 超限时仍返回错误。2026-11-25 的 baseline 用的是默认 10 行、超限报错：各数据集 10%–47% 的 case 至少被默认值截断过一次，OpenRCA Bank 有 case 为此用 OFFSET 翻了 35 页。
 - 含点号的列名在视图里改成下划线（`a.b` -> `a_b`）；`__tag__:_node_name_` 这类列名要加双引号。

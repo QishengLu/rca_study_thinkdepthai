@@ -84,6 +84,33 @@ def _enforce_token_limit(payload: str, context: str) -> str:
     return json.dumps(warning, ensure_ascii=False, indent=2)
 
 
+def _fit_rows(rows: list, more: bool) -> str:
+    """A query result as JSON. Every fetched row when they fit TOKEN_LIMIT and none were left out by `limit`;
+    otherwise the longest prefix of whole rows that fits, with a note saying how many were returned (Aiops_Context
+    words it the same way). A first row that alone does not fit is said so, so it is not read as an empty result."""
+    rows = _serialize_datetime(rows)
+
+    def dump(value) -> str:
+        return json.dumps(value, ensure_ascii=False, indent=2, default=str)
+
+    def noted(k: int) -> str:
+        note = (f"Result truncated: {k} rows returned (indexes 0 to {k - 1})." if k else
+                "Result truncated: the first row alone exceeds the result size limit; select fewer or shorter columns.")
+        return dump({"note": note, "rows": rows[:k]})
+
+    plain = dump(rows)
+    if not more and _estimate_token_count(plain) <= TOKEN_LIMIT:
+        return plain
+    lo, hi = 0, len(rows)          # the largest k whose noted payload fits
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if _estimate_token_count(noted(mid)) <= TOKEN_LIMIT:
+            lo = mid
+        else:
+            hi = mid - 1
+    return noted(lo)
+
+
 def _sandbox_root() -> Path:
     """The case's telemetry directory; the runner sets it from the payload's data_dir."""
     value = os.environ.get("RCA_CASE_DATA_DIR")
@@ -290,7 +317,7 @@ def get_schema(parquet_files: Union[str, List[str]]) -> str:
 
 
 @tool
-def query_parquet_files(parquet_files: Union[str, List[str]], query: str, limit: int = 10) -> str:
+def query_parquet_files(parquet_files: Union[str, List[str]], query: str, limit: int = 30) -> str:
     """
     Query telemetry tables using SQL syntax for data analysis and exploration.
 
@@ -300,10 +327,11 @@ def query_parquet_files(parquet_files: Union[str, List[str]], query: str, limit:
     Args:
         parquet_files: Table name(s) returned by list_tables_in_directory
         query: SQL query to execute; each table is available under its own name
-        limit: Maximum number of records to return
+        limit: Maximum number of records to return (default 30)
 
     Returns:
-        JSON string of query results
+        JSON string of query results: a list of rows, or, when rows were left out (beyond `limit` or the result
+        size limit), an object with a `note` and the `rows` returned
     """
     names = _table_names(parquet_files)
     conn = _connect()
@@ -315,9 +343,10 @@ def query_parquet_files(parquet_files: Union[str, List[str]], query: str, limit:
             conn.execute(f"CREATE VIEW {_quote_identifier(name)} AS SELECT {select} FROM {source}")
         cursor = conn.execute(query)
         columns = [desc[0] for desc in cursor.description]
-        rows = [dict(zip(columns, row)) for row in cursor.fetchmany(max(1, int(limit)))]
-        return _enforce_token_limit(json.dumps(_serialize_datetime(rows), ensure_ascii=False, indent=2, default=str),
-                                    "query_parquet_files")
+        cap = max(1, int(limit))
+        fetched = cursor.fetchmany(cap + 1)     # one more row tells whether `limit` left rows out
+        rows = [dict(zip(columns, row)) for row in fetched[:cap]]
+        return _fit_rows(rows, more=len(fetched) > cap)
     except Exception as e:
         error_msg = _safe_tool_error(e)
         # Provide contextual error messages
